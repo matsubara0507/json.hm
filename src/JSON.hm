@@ -1,0 +1,301 @@
+module JSON
+  ( Value (..)
+  , decode
+  , Parser (..)
+  , Error (..)
+  , parse
+  , jsonParser
+  , valueParser
+  , objectParser
+  , arrayParser
+  , elementParser
+  , stringParser
+  , numberParser
+  , wsParser
+  , wordParser
+  , anyCharParser
+  ) where
+
+
+import Prelude
+
+import Data.Array (Array)
+import Data.Array as Array
+import Data.Char as Char
+import Data.List as List
+import Data.Map (Map)
+import Data.Map as Map
+import Data.String as String
+
+data Value
+    = Object (Map String Value)
+    | Array (Array Value)
+    | String String
+    | Number Float
+    | Bool Bool
+    | Null
+
+instance Show Value where
+   show (Object obj) = showObject obj
+   show (Array arr)  = showArray arr
+   show (String s)   = show $ "\"" ++ s ++ "\""
+   show (Number n)   = show n
+   show (Bool b)     = show b
+   show Null         = show "null"
+
+showObject :: Map String Value -> String
+showObject obj =
+  "{" ++ String.join (map (\(k, v) -> "\"" ++ k ++ "\" : " ++ show v) $ Map.toList obj) ", " ++ "}"
+
+showArray :: Array Value -> String
+showArray arr =
+  "[" ++ String.join (map show $ Array.toList arr) ", " ++ "]"
+
+decode :: String -> Either Error Value
+decode = parse jsonParser
+
+data Parser a = Parser { parse :: String -> (String, Either Error a) }
+
+instance Functor Parser where
+  map f (Parser p) =
+    Parser $ { parse = \s -> let (s', r) = p.parse s in (s', map f r) }
+
+instance Applicative Parser where
+  pure v =
+    Parser $ { parse = \s -> (s, Right v) }
+  apply (Parser p) parser =
+    Parser $
+      { parse = \s -> let (s', r) = p.parse s in case r of
+          Left e  -> (s', Left e)
+          Right f -> let (Parser q) = map f parser in q.parse s'
+      }
+
+instance Monad Parser where
+  return = pure
+  bind (Parser p) fn =
+    Parser $
+      { parse = \s -> let (s', r) = p.parse s in case r of
+          Left e  -> (s', Left e)
+          Right a -> let (Parser q) = fn a in q.parse s'
+      }
+
+data Error
+    = UnknownError
+    | RemainingString String
+    | ExpectedBud String String
+    | ExpectedAnyCharBud String
+    | ExpectedCharsBut [Char] String
+
+instance Show Error where
+  show UnknownError =
+    "unknown error"
+  show (RemainingString rem) =
+    "remaining input '" ++ rem ++ "'"
+  show (ExpectedBud expect rem) =
+    "expected '" ++ expect ++ "' but '" ++ rem ++ "'"
+  show (ExpectedAnyCharBud rem) =
+    "expected any char but '" ++ rem ++ "'"
+  show (ExpectedCharsBut cs rem) =
+    "expected '" ++ String.join (map (\c -> "'" ++ [c] ++  "'") cs) ", " ++ "' but '" ++ rem ++ "'"
+
+fail :: forall a . Error -> Parser a
+fail e = Parser $ { parse = \s -> (s, Left e) }
+
+parse :: forall a . Parser a -> String -> Either Error a
+parse (Parser p) s = case p.parse s of
+  ("", result) -> result
+  (s', _)      -> Left (RemainingString s')
+
+jsonParser :: Parser Value
+jsonParser = elementParser
+
+valueParser :: Parser Value
+valueParser = do
+  c <- topParser
+  case c of
+    Just '{' ->
+        map Object objectParser
+    Just '[' ->
+        map Array arrayParser
+    Just '\"' ->
+        map String stringParser
+    Just 't' -> do
+        wordParser "true"
+        return (Bool true)
+    Just 'f' -> do
+        wordParser "false"
+        return (Bool false)
+    Just 'n' -> do
+        wordParser "null"
+        return Null
+    Just '-' -> do
+        anyCharParser -- pop '-'
+        map (\n -> Number $ -1.0 * n) numberParser
+    Just n | Char.isDigit n -> do
+        map Number numberParser
+    _ ->
+        fail $ ExpectedCharsBut expect (maybeToList c)
+  where
+    expect = ['{', '[', '\"', 't', 'f', 'n', '-', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9']
+
+objectParser :: Parser (Map String Value)
+objectParser = do
+  wordParser "{"
+  wsParser
+  c <- anyCharParser
+  case c of
+    '}' ->
+        pure Map.empty
+    '\"' -> do
+        key <- goStringParser ""
+        wsParser
+        wordParser ":"
+        val <- elementParser
+        membersParser $ Map.singleton key val
+    _ ->
+        fail $ ExpectedCharsBut ['}', '\"'] [c]
+
+membersParser :: Map String Value -> Parser (Map String Value)
+membersParser acc = do
+  c <- anyCharParser
+  case c of
+    '}' ->
+        pure acc
+    ',' -> do
+        wsParser
+        key <- stringParser
+        wsParser
+        wordParser ":"
+        val <- elementParser
+        membersParser $ Map.insert key val acc
+    _ ->
+        fail $ ExpectedCharsBut ['}', ','] [c]
+
+arrayParser :: Parser (Array Value)
+arrayParser = do
+  wordParser "["
+  wsParser
+  c <- topParser
+  case c of
+    Just ']' -> do
+        anyCharParser -- pop ']'
+        pure $ Array.fromList []
+    _ -> do
+        val <- elementParser
+        map Array.fromList (elementsParser [val])
+
+elementsParser :: [Value] -> Parser [Value]
+elementsParser acc = do
+  c <- anyCharParser
+  case c of
+    ']' ->
+        pure (List.reverse acc)
+    ',' -> do
+        val <- elementParser
+        elementsParser [val|acc]
+    _ ->
+        fail $ ExpectedCharsBut [']', ','] [c]
+
+elementParser :: Parser Value
+elementParser = do
+  wsParser
+  v <- valueParser
+  wsParser
+  return v
+
+stringParser :: Parser String
+stringParser = do
+  wordParser "\""
+  goStringParser ""
+
+goStringParser :: String -> Parser String
+goStringParser acc = do
+  c <- anyCharParser
+  case c of
+    '\"' -> pure (String.reverse acc)
+    _    -> goStringParser [c|acc]
+
+numberParser :: Parser Float
+numberParser = map String.toFloat numStrParser
+
+numStrParser :: Parser String
+numStrParser = do
+  n <- anyCharParser
+  case n of
+    '0' ->
+        fracStrParser "0"
+    _ -> do
+        ns <- digitsParser [n]
+        fracStrParser ns
+
+digitsParser :: String -> Parser String
+digitsParser acc = do
+  c <- topParser
+  case c of
+    Just n | Char.isDigit n -> do
+      anyCharParser -- pop digit char
+      digitsParser [n|acc]
+    _ ->
+      pure $ String.reverse acc
+
+fracStrParser :: String -> Parser String
+fracStrParser int = do
+  c <- topParser
+  if c `isJustOf` '.' then do
+    anyCharParser -- pop '.'
+    c' <- anyCharParser
+    if Char.isDigit c' then do
+      ns <- digitsParser [c']
+      expStrParser (int ++ "." ++ ns)
+    else
+      fail $ ExpectedCharsBut ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9'] [c']
+  else
+    expStrParser (int ++ ".0")
+
+expStrParser :: String -> Parser String
+expStrParser frac = do
+  c <- topParser
+  if c `isJustOf` 'e' || c `isJustOf` 'E' then do
+    anyCharParser -- pop 'e' or 'E'
+    c' <- anyCharParser
+    if c' == '-' || c' == '+' || Char.isDigit c' then do
+      ns <- digitsParser [c']
+      return (frac ++ "e" ++ ns)
+    else
+      fail $ ExpectedCharsBut ['-', '+', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9'] [c']
+  else
+    return frac
+
+wordParser :: String -> Parser ()
+wordParser w = Parser $
+  { parse = \s ->
+      if String.hasPrefix s w then
+        (String.slice s (String.length w), pure ())
+      else
+        (s, Left $ ExpectedBud w $ String.take 1 s)
+  }
+
+wsParser :: Parser ()
+wsParser = Parser ({ parse = \s -> (String.trimLeft s, Right ()) })
+
+anyCharParser :: Parser Char
+anyCharParser = Parser $
+  { parse = \s -> case s of
+      []     -> (s, Left $ ExpectedAnyCharBud s)
+      [c|s'] -> (s', Right c)
+  }
+
+topParser :: Parser (Maybe Char)
+topParser = Parser $
+  { parse = \s -> case s of
+      []    -> (s, pure Nothing)
+      [c|_] -> (s, pure $ Just c)
+  }
+
+maybeToList :: forall a . Maybe a -> [a]
+maybeToList (Just a) = [a]
+maybeToList Nothing  = []
+
+isJustOf :: forall a . Eq a => Maybe a -> a -> Bool
+isJustOf (Just a) b = a == b
+isJustOf Nothing _  = false
